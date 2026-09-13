@@ -1,22 +1,23 @@
 import io
 import re
+import unicodedata
 import jaconv
 import Levenshtein
 import pandas as pd
 from rapidfuzz import distance
 import streamlit as st
 
-# --- ページ設定 ---
+# --- ページ基本設定 ---
 st.set_page_config(
-    page_title="作品タイトル表記ゆれ照合アプリ", layout="wide"
+    page_title="高速・作品タイトル照合ツール", layout="wide"
 )
 
-st.title("📚 作品タイトル表記ゆれ照合ツール")
+st.title("⚡ 大容量対応 作品タイトル表記ゆれ照合ツール")
 st.write(
-    "2つのExcelファイルをアップロードして照合を実行すると、表記ゆれを考慮した高精度な結果が出力されます。"
+    "15万件×1万件クラスのデータもインデックス照合アルゴリズムにより高速で処理します。"
 )
 
-# --- 照合ロジック（辞書・関数） ---
+# --- 定数・辞書定義 ---
 SYNONYM_DICT = {
     "&": "アンド",
     "＆": "アンド",
@@ -26,6 +27,7 @@ SYNONYM_DICT = {
     "vol.": "巻",
     "vol": "巻",
 }
+
 NUM_MAP = {
     "Ⅰ": "1",
     "Ⅱ": "2",
@@ -37,6 +39,16 @@ NUM_MAP = {
     "Ⅷ": "8",
     "Ⅸ": "9",
     "Ⅹ": "10",
+    "ⅰ": "1",
+    "ⅱ": "2",
+    "ⅲ": "3",
+    "ⅳ": "4",
+    "ⅴ": "5",
+    "ⅵ": "6",
+    "ⅶ": "7",
+    "ⅷ": "8",
+    "ⅸ": "9",
+    "ⅹ": "10",
     "一": "1",
     "二": "2",
     "三": "3",
@@ -56,29 +68,48 @@ def clean_text(text):
     return str(text).strip()
 
 
+@st.cache_data
 def normalize_full(text):
+    """前処理（①〜③）を統合した完全正規化関数"""
     if not text:
         return ""
+
+    # Unicode正規化 (NFKC: 全角英数・記号の半角化)
+    text = unicodedata.normalize("NFKC", text)
+
+    # 1. 括弧および括弧内文字の除去
     text = re.sub(r"[\(（【\[《〈〔].*?[\)）】\]》〉〕]", "", text)
+
+    # 2. シノニム置換
     for key, val in SYNONYM_DICT.items():
         text = text.replace(key, val)
+
+    # 3. シリーズ・巻数表記除去
     text = re.sub(
         r"(season\s*\d+|第\d+[期部巻]|章|vol\.?\d+)",
         "",
         text,
         flags=re.IGNORECASE,
     )
+
+    # 4. 数字表記の統一
     for k, v in NUM_MAP.items():
         text = text.replace(k, v)
-    text = jaconv.zen2han(text, kana=False, digit=True, ascii=True)
-    text = jaconv.h2z(text, kana=True, ascii=False, digit=False)
+
+    # 5. ひらがな・カタカナ統一
     text = jaconv.kata2hira(text)
+
+    # 6. 小文字化
     text = text.lower()
+
+    # 7. 記号・スペース除去
     text = re.sub(r"[^\w\u3040-\u309F\u4E00-\u9FFF]", "", text)
+
     return text
 
 
 def extract_blocks(text, block_size=5):
+    """タイトルを「前半」「中央」「後半」に分割抽出"""
     length = len(text)
     if length == 0:
         return "", "", ""
@@ -98,196 +129,255 @@ def evaluate_block_matching(norm_a, norm_b, block_size=5):
     mid_match = mid_a == mid_b and len(mid_a) > 0
     tail_match = tail_a == tail_b and len(tail_a) > 0
     matched_count = sum([head_match, mid_match, tail_match])
-    details = []
-    if head_match:
-        details.append("前半一致")
-    if mid_match:
-        details.append("中央一致")
-    if tail_match:
-        details.append("後半一致")
-    detail_str = (
-        f"分割一致({matched_count}/3: " + ",".join(details) + ")"
-        if details
-        else "分割一致なし"
-    )
-    return matched_count, detail_str
+    return matched_count
 
 
-def calc_similarity_scores(s1, s2):
-    if not s1 or not s2:
-        return 0.0, 0.0
-    lev_score = Levenshtein.ratio(s1, s2)
-    jw_score = distance.JaroWinkler.similarity(s1, s2)
-    return lev_score, jw_score
-
-
-def evaluate_match(title_a, author_a, title_b, author_b):
-    raw_t_a, raw_a_a = clean_text(title_a), clean_text(author_a)
-    raw_t_b, raw_a_b = clean_text(title_b), clean_text(author_b)
-
-    if raw_t_a and raw_t_a == raw_t_b and raw_a_a and raw_a_a == raw_a_b:
-        return "Rank SS", 1.00, "未加工タイトル＆著者完全一致"
-    if raw_t_a and raw_t_a == raw_t_b:
-        return "Rank S", 1.00, "未加工タイトル完全一致"
-
-    norm_t_a, norm_t_b = normalize_full(raw_t_a), normalize_full(raw_t_b)
-    if not norm_t_a or not norm_t_b:
-        return "Rank E", 0.00, "不一致（文字なし）"
-
-    if norm_t_a == norm_t_b:
-        return "Rank A", 0.90, "完全正規化タイトル一致"
-
-    block_matched_count, block_detail = evaluate_block_matching(
-        norm_t_a, norm_t_b, block_size=5
-    )
-    if block_matched_count >= 2:
-        return "Rank B", 0.75, f"高精度部分一致 [{block_detail}]"
-
-    contains_7chars = (
-        norm_t_a in norm_t_b and len(norm_t_a) >= 7
-    ) or (norm_t_b in norm_t_a and len(norm_t_b) >= 7)
-    prefix_15 = (
-        norm_t_a[:15] == norm_t_b[:15]
-        if len(norm_t_a) >= 15 and len(norm_t_b) >= 15
-        else False
-    )
-
-    if contains_7chars or prefix_15:
-        match_detail = (
-            "一方が他方を含む(7文字以上)"
-            if contains_7chars
-            else "先頭15文字一致"
-        )
-        return "Rank B", 0.70, match_detail
-
-    lev_score, jw_score = calc_similarity_scores(norm_t_a, norm_t_b)
-    prefix_10 = (
-        norm_t_a[:10] == norm_t_b[:10]
-        if len(norm_t_a) >= 10 and len(norm_t_b) >= 10
-        else False
-    )
-
-    if (
-        lev_score >= 0.80
-        or jw_score >= 0.80
-        or prefix_10
-        or block_matched_count >= 1
-    ):
-        extra_info = f" [{block_detail}]" if block_matched_count == 1 else ""
-        return (
-            "Rank C",
-            0.60,
-            f"類似度(Lev:{lev_score:.2f}, JW:{jw_score:.2f}){extra_info}",
-        )
-
-    prefix_7 = (
-        norm_t_a[:7] == norm_t_b[:7]
-        if len(norm_t_a) >= 7 and len(norm_t_b) >= 7
-        else False
-    )
-    if lev_score >= 0.70 or prefix_7:
-        return (
-            "Rank D",
-            0.50,
-            f"類似度(Lev:{lev_score:.2f}) / 先頭7文字:{prefix_7}",
-        )
-
-    return "Rank E", 0.00, "不一致"
-
-
-# --- 画面レイアウト（ファイルアップロード） ---
+# --- ファイルアップロードUI ---
 col1, col2 = st.columns(2)
 with col1:
     file_a = st.file_uploader(
-        "ファイルA（基幹データ）をアップロード", type=["xlsx", "xls"]
+        "ファイルA (file_a.xlsx / 最大15万件)", type=["xlsx", "xls"]
     )
 with col2:
     file_b = st.file_uploader(
-        "ファイルB（比較データ）をアップロード", type=["xlsx", "xls"]
+        "ファイルB (file_b.xlsx / 最大1万件)", type=["xlsx", "xls"]
     )
 
 if file_a and file_b:
-    df_a = pd.read_excel(file_a)
-    df_b = pd.read_excel(file_b)
+    st.success("ファイルの読み込み完了。照合準備ができました。")
 
-    st.success("ファイルの読み込みに成功しました。")
+    if st.button("🚀 超高速照合を実行する", type="primary"):
+        with st.spinner("データを読み込んでインデックスを作成中..."):
+            df_a = pd.read_excel(file_a)
+            df_b = pd.read_excel(file_b)
 
-    if st.button("🚀 照合を実行する", type="primary"):
-        progress_bar = st.progress(0)
-        results = []
-        total_rows = len(df_a)
+            # カラム存在チェック
+            col_t_a = "タイトル" if "タイトル" in df_a.columns else df_a.columns[0]
+            col_a_a = "著者" if "著者" in df_a.columns else None
+            col_t_b = "タイトル" if "タイトル" in df_b.columns else df_b.columns[0]
+            col_a_b = "著者" if "著者" in df_b.columns else None
 
-        rank_order = {
-            "Rank SS": 6,
-            "Rank S": 5,
-            "Rank A": 4,
-            "Rank B": 3,
-            "Rank C": 2,
-            "Rank D": 1,
-            "Rank E": 0,
-        }
+            # 前処理と正規化列の事前計算（ベクトル処理）
+            df_a["raw_t"] = df_a[col_t_a].apply(clean_text)
+            df_a["raw_a"] = df_a[col_a_a].apply(clean_text) if col_a_a else ""
+            df_a["norm_t"] = df_a["raw_t"].apply(normalize_full)
 
-        for idx_a, row_a in df_a.iterrows():
-            title_a = row_a.get("タイトル", "")
-            author_a = row_a.get("著者", "")
+            df_b["raw_t"] = df_b[col_t_b].apply(clean_text)
+            df_b["raw_a"] = df_b[col_a_b].apply(clean_text) if col_a_b else ""
+            df_b["norm_t"] = df_b["raw_t"].apply(normalize_full)
 
-            best_rank, best_score, best_detail = "Rank E", 0.00, ""
-            best_match_row = None
+            # --- 高速検索用インデックス（辞書）の作成 ---
+            # 1. 完全未加工 (タイトル+著者)
+            dict_ss = {}
+            # 2. 未加工タイトルのみ
+            dict_s = {}
+            # 3. 完全正規化タイトル
+            dict_a = {}
+            # 4. 先頭バケット (類似度計算用: 先頭3文字をキーにして絞り込み)
+            prefix_bucket_b = {}
 
             for idx_b, row_b in df_b.iterrows():
-                title_b = row_b.get("タイトル", "")
-                author_b = row_b.get("著者", "")
+                rt = row_b["raw_t"]
+                ra = row_b["raw_a"]
+                nt = row_b["norm_t"]
 
-                rank, score, detail = evaluate_match(
-                    title_a, author_a, title_b, author_b
-                )
+                if rt and ra:
+                    dict_ss.setdefault(f"{rt}____{ra}", []).append(row_b)
+                if rt:
+                    dict_s.setdefault(rt, []).append(row_b)
+                if nt:
+                    dict_a.setdefault(nt, []).append(row_b)
 
-                if (rank_order[rank] > rank_order[best_rank]) or (
-                    rank_order[rank] == rank_order[best_rank]
-                    and score > best_score
-                ):
-                    best_rank, best_score, best_detail = rank, score, detail
-                    best_match_row = row_b
-                    if best_rank == "Rank SS":
+                    # バケット登録
+                    p3 = nt[:3]
+                    prefix_bucket_b.setdefault(p3, []).append(row_b)
+
+        # --- 照合ループ実行 ---
+        results = []
+        progress_bar = st.progress(0)
+        total_a = len(df_a)
+
+        for idx_a, row_a in df_a.iterrows():
+            rt_a = row_a["raw_t"]
+            ra_a = row_a["raw_a"]
+            nt_a = row_a["norm_t"]
+
+            matched = False
+            best_rank, best_score, best_detail = "Rank E", 0.00, "不一致"
+            best_match_row = None
+
+            # --- Rank SS 判定 ($O(1)$) ---
+            if not matched and rt_a and ra_a:
+                key_ss = f"{rt_a}____{ra_a}"
+                if key_ss in dict_ss:
+                    best_match_row = dict_ss[key_ss][0]
+                    best_rank, best_score, best_detail = (
+                        "Rank SS",
+                        1.00,
+                        "未加工タイトル＆著者完全一致",
+                    )
+                    matched = True
+
+            # --- Rank S 判定 ($O(1)$) ---
+            if not matched and rt_a:
+                if rt_a in dict_s:
+                    best_match_row = dict_s[rt_a][0]
+                    best_rank, best_score, best_detail = (
+                        "Rank S",
+                        1.00,
+                        "未加工タイトル完全一致",
+                    )
+                    matched = True
+
+            # --- Rank A 判定 ($O(1)$) ---
+            if not matched and nt_a:
+                if nt_a in dict_a:
+                    best_match_row = dict_a[nt_a][0]
+                    best_rank, best_score, best_detail = (
+                        "Rank A",
+                        0.90,
+                        "完全正規化タイトル一致",
+                    )
+                    matched = True
+
+            # --- Rank B / C / D 判定（絞り込み探索） ---
+            if not matched and nt_a:
+                # 先頭3文字が一致する候補グループのみを対象にして高速化
+                p3 = nt_a[:3]
+                candidate_list = prefix_bucket_b.get(p3, [])
+
+                # もしバケットになければ全件ではなく一部だけ（またはスキップ）探す
+                if not candidate_list and len(nt_a) >= 3:
+                    candidate_list = df_b.itertuples()  # フォールバック
+                else:
+                    # イテレータ化
+                    candidate_list = [c for c in candidate_list]
+
+                for row_b in candidate_list:
+                    nt_b = (
+                        row_b.norm_t
+                        if hasattr(row_b, "norm_t")
+                        else row_b["norm_t"]
+                    )
+                    if not nt_b:
+                        continue
+
+                    # Rank B
+                    block_cnt = evaluate_block_matching(nt_a, nt_b)
+                    contains_7 = (nt_a in nt_b and len(nt_a) >= 7) or (
+                        nt_b in nt_a and len(nt_b) >= 7
+                    )
+                    prefix_15 = (
+                        nt_a[:15] == nt_b[:15]
+                        if len(nt_a) >= 15 and len(nt_b) >= 15
+                        else False
+                    )
+
+                    if block_cnt >= 2 or contains_7 or prefix_15:
+                        best_rank, best_score, best_detail = (
+                            "Rank B",
+                            0.70,
+                            "高精度部分一致/包含/先頭15文字一致",
+                        )
+                        best_match_row = (
+                            row_b
+                            if not hasattr(row_b, "_asdict")
+                            else row_b._asdict()
+                        )
+                        matched = True
                         break
+
+                    # 類似度計算
+                    lev_score = Levenshtein.ratio(nt_a, nt_b)
+                    jw_score = distance.JaroWinkler.similarity(nt_a, nt_b)
+                    prefix_10 = (
+                        nt_a[:10] == nt_b[:10]
+                        if len(nt_a) >= 10 and len(nt_b) >= 10
+                        else False
+                    )
+
+                    # Rank C
+                    if (
+                        lev_score >= 0.80
+                        or jw_score >= 0.80
+                        or prefix_10
+                        or block_cnt >= 1
+                    ):
+                        if best_score < 0.60:
+                            best_rank, best_score, best_detail = (
+                                "Rank C",
+                                0.60,
+                                f"類似度(Lev:{lev_score:.2f}) / 先頭10文字:{prefix_10}",
+                            )
+                            best_match_row = (
+                                row_b
+                                if not hasattr(row_b, "_asdict")
+                                else row_b._asdict()
+                            )
+
+                    # Rank D
+                    elif lev_score >= 0.70 or (
+                        len(nt_a) >= 7
+                        and len(nt_b) >= 7
+                        and nt_a[:7] == nt_b[:7]
+                    ):
+                        if best_score < 0.50:
+                            best_rank, best_score, best_detail = (
+                                "Rank D",
+                                0.50,
+                                f"類似度(Lev:{lev_score:.2f})",
+                            )
+                            best_match_row = (
+                                row_b
+                                if not hasattr(row_b, "_asdict")
+                                else row_b._asdict()
+                            )
+
+            # 結果格納
+            b_title = ""
+            b_author = ""
+            if best_match_row is not None:
+                if isinstance(best_match_row, dict):
+                    b_title = best_match_row.get("raw_t", "")
+                    b_author = best_match_row.get("raw_a", "")
+                elif hasattr(best_match_row, "raw_t"):
+                    b_title = getattr(best_match_row, "raw_t", "")
+                    b_author = getattr(best_match_row, "raw_a", "")
+                else:
+                    b_title = best_match_row["raw_t"]
+                    b_author = best_match_row["raw_a"]
 
             results.append(
                 {
-                    "ファイルA_タイトル": title_a,
-                    "ファイルA_著者": author_a,
+                    "ファイルA_タイトル": rt_a,
+                    "ファイルA_著者": ra_a,
                     "判定ランク": best_rank,
                     "スコア": best_score,
                     "マッチ詳細・条件": best_detail,
-                    "ファイルB_候補タイトル": (
-                        best_match_row.get("タイトル", "")
-                        if best_match_row is not None and best_rank != "Rank E"
-                        else "該当なし"
-                    ),
-                    "ファイルB_候補著者": (
-                        best_match_row.get("著者", "")
-                        if best_match_row is not None and best_rank != "Rank E"
-                        else "該当なし"
-                    ),
+                    "ファイルB_候補タイトル": b_title if matched or best_score > 0 else "該当なし",
+                    "ファイルB_候補著者": b_author if matched or best_score > 0 else "該当なし",
                 }
             )
 
-            # プログレスバー更新
-            progress_bar.progress((idx_a + 1) / total_rows)
+            # プログレスバー更新 (1,000件ごとに更新してオーバーヘッド削減)
+            if idx_a % 1000 == 0 or idx_a == total_a - 1:
+                progress_bar.progress((idx_a + 1) / total_a)
 
         result_df = pd.DataFrame(results)
 
-        st.subheader("📊 照合結果プレビュー")
-        st.dataframe(result_df, use_container_width=True)
+        st.success("照合処理が完了しました！")
+        st.subheader("📊 照合結果プレビュー (先頭100件を表示)")
+        st.dataframe(result_df.head(100), use_container_width=True)
 
-        # Excelダウンロードボタンの準備
+        # Excelのバイナリ生成
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             result_df.to_excel(writer, index=False)
         processed_data = output.getvalue()
 
         st.download_button(
-            label="📥 照合結果Excelをダウンロード",
+            label="📥 全件の照合結果Excelをダウンロード",
             data=processed_data,
-            file_name="match_result_streamlit.xlsx",
+            file_name="match_result_fast.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
